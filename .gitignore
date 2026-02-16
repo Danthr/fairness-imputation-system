@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Data files (don't upload datasets to GitHub)
+data/raw/*
+data/processed/*
+data/outputs/*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Environment variables
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
