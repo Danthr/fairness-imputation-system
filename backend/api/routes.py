@@ -13,7 +13,7 @@ from pathlib import Path
 import logging
 
 from backend.data_processing import DataIngestion, DataValidator
-from backend.imputation import ImputationEngine
+from backend.imputation import ImputationEngine, EnhancedImputationEngine
 from backend.fairness_audit import FairnessAuditor
 
 logger = logging.getLogger(__name__)
@@ -123,7 +123,9 @@ def process_dataset():
     Request body:
         {
             "dataset_id": "uuid",
+            "method": "knn" | "mice" | "random_forest" | "compare_all",  # optional, default: knn
             "n_neighbors": 5,  # optional
+            "include_confidence": true | false,  # optional, default: false
             "protected_attributes": ["gender", "race"]  # optional
         }
     
@@ -145,9 +147,11 @@ def process_dataset():
         
         # Get parameters
         n_neighbors = data.get('n_neighbors', 5)
+        method = data.get('method', 'knn')
+        include_confidence = data.get('include_confidence', False)
         protected_attrs = data.get('protected_attributes', None)
         
-        logger.info(f"Processing dataset: {dataset_id}")
+        logger.info(f"Processing dataset: {dataset_id} with method: {method}")
         
         # Load dataset
         file_path = results_store[dataset_id]['file_path']
@@ -158,10 +162,38 @@ def process_dataset():
         logger.info("Step 1: Preprocessing...")
         df_processed = ingestion.preprocess_dataset(df)
         
-        # Step 2: Imputation
-        logger.info("Step 2: Running KNN imputation...")
-        engine = ImputationEngine(n_neighbors=n_neighbors)
-        df_imputed, imputation_stats = engine.knn_impute(df_processed)
+        # Step 2: Imputation with method selection
+        logger.info(f"Step 2: Running {method} imputation...")
+        
+        comparison_results = None
+        confidence_scores = None
+        
+        if method == 'compare_all':
+            # Compare all methods
+            engine = EnhancedImputationEngine(n_neighbors=n_neighbors)
+            comparison_results = engine.compare_all_methods(df_processed)
+            # Use KNN results for final dataset
+            df_imputed, imputation_stats, confidence_scores = engine.knn_impute_with_confidence(df_processed)
+            
+        elif method == 'knn' and include_confidence:
+            # KNN with confidence scores
+            engine = EnhancedImputationEngine(n_neighbors=n_neighbors)
+            df_imputed, imputation_stats, confidence_scores = engine.knn_impute_with_confidence(df_processed)
+            
+        elif method == 'mice':
+            # MICE imputation
+            engine = EnhancedImputationEngine(n_neighbors=n_neighbors)
+            df_imputed, imputation_stats = engine.mice_impute(df_processed)
+            
+        elif method == 'random_forest':
+            # Random Forest imputation
+            engine = EnhancedImputationEngine(n_neighbors=n_neighbors)
+            df_imputed, imputation_stats = engine.random_forest_impute(df_processed)
+            
+        else:
+            # Default: basic KNN without confidence
+            engine = ImputationEngine(n_neighbors=n_neighbors)
+            df_imputed, imputation_stats = engine.knn_impute(df_processed)
         
         # Get imputation report
         imputation_report = engine.get_imputation_report(df_processed, df_imputed)
@@ -211,12 +243,14 @@ def process_dataset():
             'fairness_results': fairness_results,
             'protected_attributes': protected_attrs,
             'output_path': output_path,
-            'n_neighbors_used': n_neighbors
+            'n_neighbors_used': n_neighbors,
+            'method_used': method
         })
         
         logger.info(f"Processing complete for dataset: {dataset_id}")
         
-        return jsonify({
+        # Build response with optional fields
+        response = {
             'dataset_id': dataset_id,
             'message': 'Processing complete',
             'imputation': {
@@ -225,7 +259,16 @@ def process_dataset():
             },
             'fairness_audit': fairness_results,
             'output_file': output_path
-        }), 200
+        }
+        
+        # Add optional fields if available
+        if confidence_scores:
+            response['confidence_scores'] = convert_numpy_types(confidence_scores)
+        
+        if comparison_results:
+            response['method_comparison'] = convert_numpy_types(comparison_results)
+        
+        return jsonify(response), 200
         
     except Exception as e:
         logger.error(f"Error processing dataset: {str(e)}")
@@ -265,7 +308,8 @@ def get_results(dataset_id):
             },
             'fairness_audit': results['fairness_results'],
             'protected_attributes': results['protected_attributes'],
-            'output_file': results['output_path']
+            'output_file': results['output_path'],
+            'method_used': results.get('method_used', 'knn')
         }), 200
         
     except Exception as e:
@@ -289,7 +333,8 @@ def list_datasets():
                 'filename': info['filename'],
                 'processed': info.get('processed', False),
                 'total_rows': info['stats']['total_rows'],
-                'total_columns': info['stats']['total_columns']
+                'total_columns': info['stats']['total_columns'],
+                'method_used': info.get('method_used', 'N/A')
             })
         
         return jsonify({
