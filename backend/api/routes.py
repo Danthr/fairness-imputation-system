@@ -13,7 +13,7 @@ from pathlib import Path
 import logging
 
 from backend.data_processing import DataIngestion, DataValidator
-from backend.imputation import ImputationEngine, EnhancedImputationEngine
+from backend.imputation import ImputationEngine, EnhancedImputationEngine, ImputationQualityMetrics
 from backend.fairness_audit import FairnessAuditor
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ def allowed_file(filename):
 def upload_file():
     """
     Upload dataset file
-    
+
     Returns:
         JSON with dataset_id and basic info
     """
@@ -60,40 +60,40 @@ def upload_file():
         # Check if file is in request
         if 'file' not in request.files:
             return jsonify({'error': 'No file provided'}), 400
-        
+
         file = request.files['file']
-        
+
         # Check if file is selected
         if file.filename == '':
             return jsonify({'error': 'No file selected'}), 400
-        
+
         # Check if file type is allowed
         if not allowed_file(file.filename):
             return jsonify({'error': 'File type not allowed. Use CSV or Excel files'}), 400
-        
+
         # Generate unique ID for this dataset
         dataset_id = str(uuid.uuid4())
-        
+
         # Save file
         filename = secure_filename(file.filename)
         file_path = Path('data/raw') / f"{dataset_id}_{filename}"
         file.save(str(file_path))
-        
+
         logger.info(f"File uploaded: {filename} with ID: {dataset_id}")
-        
+
         # Load and validate dataset
         ingestion = DataIngestion()
         df, message = ingestion.load_dataset(str(file_path))
-        
+
         if df is None:
             return jsonify({'error': message}), 400
-        
+
         # Get basic statistics
         stats = ingestion.get_basic_stats(df)
-        
+
         # Convert numpy types
         stats = convert_numpy_types(stats)
-        
+
         # Store dataset info
         results_store[dataset_id] = {
             'filename': filename,
@@ -102,14 +102,14 @@ def upload_file():
             'stats': stats,
             'processed': False
         }
-        
+
         return jsonify({
             'dataset_id': dataset_id,
             'filename': filename,
             'message': 'File uploaded successfully',
             'stats': stats
         }), 200
-        
+
     except Exception as e:
         logger.error(f"Error uploading file: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -119,93 +119,111 @@ def upload_file():
 def process_dataset():
     """
     Process dataset: imputation + fairness audit
-    
+
     Request body:
         {
             "dataset_id": "uuid",
             "method": "knn" | "mice" | "random_forest" | "compare_all",  # optional, default: knn
             "n_neighbors": 5,  # optional
             "include_confidence": true | false,  # optional, default: false
+            "include_quality": true | false,  # optional, default: false  NEW
+            "quality_methods": ["knn","mice","rf","mean"],  # optional  NEW
+            "include_cv": true | false,  # optional, default: false  NEW
             "protected_attributes": ["gender", "race"]  # optional
         }
-    
+
     Returns:
         JSON with processing results
     """
     try:
         data = request.get_json()
-        
+
         # Validate request
         if not data or 'dataset_id' not in data:
             return jsonify({'error': 'dataset_id required'}), 400
-        
+
         dataset_id = data['dataset_id']
-        
+
         # Check if dataset exists
         if dataset_id not in results_store:
             return jsonify({'error': 'Dataset not found'}), 404
-        
+
         # Get parameters
-        n_neighbors = data.get('n_neighbors', 5)
-        method = data.get('method', 'knn')
+        n_neighbors        = data.get('n_neighbors', 5)
+        method             = data.get('method', 'knn')
         include_confidence = data.get('include_confidence', False)
-        protected_attrs = data.get('protected_attributes', None)
-        
+        include_quality    = data.get('include_quality', False)                    # NEW
+        quality_methods    = data.get('quality_methods', ['knn', 'mice', 'rf', 'mean'])  # NEW
+        include_cv         = data.get('include_cv', False)                         # NEW
+        protected_attrs    = data.get('protected_attributes', None)
+
         logger.info(f"Processing dataset: {dataset_id} with method: {method}")
-        
+
         # Load dataset
         file_path = results_store[dataset_id]['file_path']
         ingestion = DataIngestion()
         df, _ = ingestion.load_dataset(file_path)
-        
+
         # Step 1: Preprocess
         logger.info("Step 1: Preprocessing...")
         df_processed = ingestion.preprocess_dataset(df)
-        
+
         # Step 2: Imputation with method selection
         logger.info(f"Step 2: Running {method} imputation...")
-        
+
         comparison_results = None
-        confidence_scores = None
-        
+        confidence_scores  = None
+
         if method == 'compare_all':
-            # Compare all methods
-            engine = EnhancedImputationEngine(n_neighbors=n_neighbors)
+            engine             = EnhancedImputationEngine(n_neighbors=n_neighbors)
             comparison_results = engine.compare_all_methods(df_processed)
             # Use KNN results for final dataset
             df_imputed, imputation_stats, confidence_scores = engine.knn_impute_with_confidence(df_processed)
-            
+
         elif method == 'knn' and include_confidence:
             # KNN with confidence scores
-            engine = EnhancedImputationEngine(n_neighbors=n_neighbors)
+            engine             = EnhancedImputationEngine(n_neighbors=n_neighbors)
             df_imputed, imputation_stats, confidence_scores = engine.knn_impute_with_confidence(df_processed)
-            
+
         elif method == 'mice':
             # MICE imputation
-            engine = EnhancedImputationEngine(n_neighbors=n_neighbors)
+            engine             = EnhancedImputationEngine(n_neighbors=n_neighbors)
             df_imputed, imputation_stats = engine.mice_impute(df_processed)
-            
+
         elif method == 'random_forest':
             # Random Forest imputation
-            engine = EnhancedImputationEngine(n_neighbors=n_neighbors)
+            engine             = EnhancedImputationEngine(n_neighbors=n_neighbors)
             df_imputed, imputation_stats = engine.random_forest_impute(df_processed)
-            
+
         else:
             # Default: basic KNN without confidence
-            engine = ImputationEngine(n_neighbors=n_neighbors)
+            engine             = ImputationEngine(n_neighbors=n_neighbors)
             df_imputed, imputation_stats = engine.knn_impute(df_processed)
-        
+
         # Get imputation report
         imputation_report = engine.get_imputation_report(df_processed, df_imputed)
-        
-        # Step 3: Fairness Audit
-        logger.info("Step 3: Running fairness audit...")
+
+        # Step 3: Quality Metrics (NEW)
+        quality_results = None
+        if include_quality:
+            logger.info("Step 3: Running quality metrics evaluation...")
+            qm = ImputationQualityMetrics()
+            quality_results = qm.compare_method_quality(
+                df_processed,
+                methods=quality_methods,
+                n_neighbors=n_neighbors,
+                include_cv=include_cv,
+            )
+            quality_results = convert_numpy_types(quality_results)
+
+        # Step 4: Fairness Audit
+        logger.info("Step 4: Running fairness audit...")
         auditor = FairnessAuditor()
-        
+
         # Auto-detect protected attributes if not provided
         if protected_attrs is None:
             protected_attrs = auditor.detect_protected_attributes(df_imputed)
-        
+
         # Run audit on each protected attribute
         fairness_results = {}
         if protected_attrs:
@@ -213,63 +231,66 @@ def process_dataset():
             numerical_cols = df_imputed.select_dtypes(include=['number']).columns.tolist()
             if numerical_cols:
                 outcome_attr = numerical_cols[0]
-                
+
                 for attr in protected_attrs:
                     try:
                         audit_result = auditor.audit_simple(
-                            df_imputed, 
-                            attr, 
+                            df_imputed,
+                            attr,
                             outcome_attr
                         )
                         fairness_results[attr] = audit_result
                     except Exception as e:
                         logger.error(f"Error auditing {attr}: {str(e)}")
                         fairness_results[attr] = {'error': str(e)}
-        
+
         # Save processed dataset
         output_filename = f"{dataset_id}_processed.csv"
         output_path = ingestion.save_dataset(df_imputed, output_filename, 'outputs')
-        
+
         # Convert all results to JSON-serializable types
-        imputation_stats = convert_numpy_types(imputation_stats)
+        imputation_stats       = convert_numpy_types(imputation_stats)
         imputation_report_dict = convert_numpy_types(imputation_report.to_dict('records'))
-        fairness_results = convert_numpy_types(fairness_results)
-        
+        fairness_results       = convert_numpy_types(fairness_results)
+
         # Store results
         results_store[dataset_id].update({
-            'processed': True,
-            'imputation_stats': imputation_stats,
-            'imputation_report': imputation_report_dict,
-            'fairness_results': fairness_results,
-            'protected_attributes': protected_attrs,
-            'output_path': output_path,
-            'n_neighbors_used': n_neighbors,
-            'method_used': method
+            'processed':             True,
+            'imputation_stats':      imputation_stats,
+            'imputation_report':     imputation_report_dict,
+            'fairness_results':      fairness_results,
+            'protected_attributes':  protected_attrs,
+            'output_path':           output_path,
+            'n_neighbors_used':      n_neighbors,
+            'method_used':           method
         })
-        
+
         logger.info(f"Processing complete for dataset: {dataset_id}")
-        
+
         # Build response with optional fields
         response = {
             'dataset_id': dataset_id,
-            'message': 'Processing complete',
+            'message':    'Processing complete',
             'imputation': {
-                'stats': imputation_stats,
+                'stats':  imputation_stats,
                 'report': imputation_report_dict
             },
             'fairness_audit': fairness_results,
-            'output_file': output_path
+            'output_file':    output_path
         }
-        
+
         # Add optional fields if available
         if confidence_scores:
             response['confidence_scores'] = convert_numpy_types(confidence_scores)
-        
+
         if comparison_results:
             response['method_comparison'] = convert_numpy_types(comparison_results)
-        
+
+        if quality_results is not None:          # NEW
+            response['quality_metrics'] = quality_results  # NEW
+
         return jsonify(response), 200
-        
+
     except Exception as e:
         logger.error(f"Error processing dataset: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -279,39 +300,39 @@ def process_dataset():
 def get_results(dataset_id):
     """
     Get results for a processed dataset
-    
+
     Returns:
         JSON with all results
     """
     try:
         if dataset_id not in results_store:
             return jsonify({'error': 'Dataset not found'}), 404
-        
+
         results = results_store[dataset_id]
-        
+
         if not results.get('processed', False):
             return jsonify({
                 'dataset_id': dataset_id,
-                'status': 'uploaded',
-                'message': 'Dataset not processed yet. Call /process first.',
-                'stats': results.get('stats', {})
+                'status':     'uploaded',
+                'message':    'Dataset not processed yet. Call /process first.',
+                'stats':      results.get('stats', {})
             }), 200
-        
+
         return jsonify({
-            'dataset_id': dataset_id,
-            'status': 'processed',
-            'filename': results['filename'],
-            'stats': results['stats'],
+            'dataset_id':           dataset_id,
+            'status':               'processed',
+            'filename':             results['filename'],
+            'stats':                results['stats'],
             'imputation': {
-                'stats': results['imputation_stats'],
+                'stats':  results['imputation_stats'],
                 'report': results['imputation_report']
             },
-            'fairness_audit': results['fairness_results'],
+            'fairness_audit':       results['fairness_results'],
             'protected_attributes': results['protected_attributes'],
-            'output_file': results['output_path'],
-            'method_used': results.get('method_used', 'knn')
+            'output_file':          results['output_path'],
+            'method_used':          results.get('method_used', 'knn')
         }), 200
-        
+
     except Exception as e:
         logger.error(f"Error getting results: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -321,7 +342,7 @@ def get_results(dataset_id):
 def list_datasets():
     """
     List all uploaded datasets
-    
+
     Returns:
         JSON with list of datasets
     """
@@ -329,19 +350,19 @@ def list_datasets():
         datasets = []
         for dataset_id, info in results_store.items():
             datasets.append({
-                'dataset_id': dataset_id,
-                'filename': info['filename'],
-                'processed': info.get('processed', False),
-                'total_rows': info['stats']['total_rows'],
+                'dataset_id':    dataset_id,
+                'filename':      info['filename'],
+                'processed':     info.get('processed', False),
+                'total_rows':    info['stats']['total_rows'],
                 'total_columns': info['stats']['total_columns'],
-                'method_used': info.get('method_used', 'N/A')
+                'method_used':   info.get('method_used', 'N/A')
             })
-        
+
         return jsonify({
             'total_datasets': len(datasets),
-            'datasets': datasets
+            'datasets':       datasets
         }), 200
-        
+
     except Exception as e:
         logger.error(f"Error listing datasets: {str(e)}")
         return jsonify({'error': str(e)}), 500
