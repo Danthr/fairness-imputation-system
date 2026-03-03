@@ -13,7 +13,7 @@ from pathlib import Path
 import logging
 
 from backend.data_processing import DataIngestion, DataValidator
-from backend.imputation import ImputationEngine, EnhancedImputationEngine, ImputationQualityMetrics
+from backend.imputation import ImputationEngine, EnhancedImputationEngine, ImputationQualityMetrics, DataQualityScorer
 from backend.fairness_audit import FairnessAuditor
 
 logger = logging.getLogger(__name__)
@@ -124,12 +124,13 @@ def process_dataset():
         {
             "dataset_id": "uuid",
             "method": "knn" | "mice" | "random_forest" | "compare_all",  # optional, default: knn
-            "n_neighbors": 5,  # optional
-            "include_confidence": true | false,  # optional, default: false
-            "include_quality": true | false,  # optional, default: false  NEW
-            "quality_methods": ["knn","mice","rf","mean"],  # optional  NEW
-            "include_cv": true | false,  # optional, default: false  NEW
-            "protected_attributes": ["gender", "race"]  # optional
+            "n_neighbors": 5,                        # optional
+            "include_confidence": true | false,      # optional, default: false
+            "include_quality": true | false,          # optional, default: false
+            "quality_methods": ["knn","mice","rf","mean"],  # optional
+            "include_cv": true | false,              # optional, default: false
+            "include_data_quality": true | false,    # optional, default: false  NEW
+            "protected_attributes": ["gender","race"] # optional
         }
 
     Returns:
@@ -149,13 +150,14 @@ def process_dataset():
             return jsonify({'error': 'Dataset not found'}), 404
 
         # Get parameters
-        n_neighbors        = data.get('n_neighbors', 5)
-        method             = data.get('method', 'knn')
-        include_confidence = data.get('include_confidence', False)
-        include_quality    = data.get('include_quality', False)                    # NEW
-        quality_methods    = data.get('quality_methods', ['knn', 'mice', 'rf', 'mean'])  # NEW
-        include_cv         = data.get('include_cv', False)                         # NEW
-        protected_attrs    = data.get('protected_attributes', None)
+        n_neighbors          = data.get('n_neighbors', 5)
+        method               = data.get('method', 'knn')
+        include_confidence   = data.get('include_confidence', False)
+        include_quality      = data.get('include_quality', False)
+        quality_methods      = data.get('quality_methods', ['knn', 'mice', 'rf', 'mean'])
+        include_cv           = data.get('include_cv', False)
+        include_data_quality = data.get('include_data_quality', False)    # NEW
+        protected_attrs      = data.get('protected_attributes', None)
 
         logger.info(f"Processing dataset: {dataset_id} with method: {method}")
 
@@ -177,36 +179,31 @@ def process_dataset():
         if method == 'compare_all':
             engine             = EnhancedImputationEngine(n_neighbors=n_neighbors)
             comparison_results = engine.compare_all_methods(df_processed)
-            # Use KNN results for final dataset
             df_imputed, imputation_stats, confidence_scores = engine.knn_impute_with_confidence(df_processed)
 
         elif method == 'knn' and include_confidence:
-            # KNN with confidence scores
             engine             = EnhancedImputationEngine(n_neighbors=n_neighbors)
             df_imputed, imputation_stats, confidence_scores = engine.knn_impute_with_confidence(df_processed)
 
         elif method == 'mice':
-            # MICE imputation
             engine             = EnhancedImputationEngine(n_neighbors=n_neighbors)
             df_imputed, imputation_stats = engine.mice_impute(df_processed)
 
         elif method == 'random_forest':
-            # Random Forest imputation
             engine             = EnhancedImputationEngine(n_neighbors=n_neighbors)
             df_imputed, imputation_stats = engine.random_forest_impute(df_processed)
 
         else:
-            # Default: basic KNN without confidence
             engine             = ImputationEngine(n_neighbors=n_neighbors)
             df_imputed, imputation_stats = engine.knn_impute(df_processed)
 
         # Get imputation report
         imputation_report = engine.get_imputation_report(df_processed, df_imputed)
 
-        # Step 3: Quality Metrics (NEW)
+        # Step 3: Imputation Quality Metrics
         quality_results = None
         if include_quality:
-            logger.info("Step 3: Running quality metrics evaluation...")
+            logger.info("Step 3: Running imputation quality metrics...")
             qm = ImputationQualityMetrics()
             quality_results = qm.compare_method_quality(
                 df_processed,
@@ -216,18 +213,23 @@ def process_dataset():
             )
             quality_results = convert_numpy_types(quality_results)
 
-        # Step 4: Fairness Audit
-        logger.info("Step 4: Running fairness audit...")
+        # Step 4: Data Quality Scoring (NEW)
+        data_quality_results = None
+        if include_data_quality:
+            logger.info("Step 4: Running data quality scoring...")
+            scorer = DataQualityScorer()
+            data_quality_results = scorer.score_all(df_processed)
+            data_quality_results = convert_numpy_types(data_quality_results)
+
+        # Step 5: Fairness Audit
+        logger.info("Step 5: Running fairness audit...")
         auditor = FairnessAuditor()
 
-        # Auto-detect protected attributes if not provided
         if protected_attrs is None:
             protected_attrs = auditor.detect_protected_attributes(df_imputed)
 
-        # Run audit on each protected attribute
         fairness_results = {}
         if protected_attrs:
-            # Use first numerical column as outcome
             numerical_cols = df_imputed.select_dtypes(include=['number']).columns.tolist()
             if numerical_cols:
                 outcome_attr = numerical_cols[0]
@@ -267,7 +269,7 @@ def process_dataset():
 
         logger.info(f"Processing complete for dataset: {dataset_id}")
 
-        # Build response with optional fields
+        # Build response
         response = {
             'dataset_id': dataset_id,
             'message':    'Processing complete',
@@ -279,20 +281,61 @@ def process_dataset():
             'output_file':    output_path
         }
 
-        # Add optional fields if available
+        # Add optional fields
         if confidence_scores:
             response['confidence_scores'] = convert_numpy_types(confidence_scores)
 
         if comparison_results:
             response['method_comparison'] = convert_numpy_types(comparison_results)
 
-        if quality_results is not None:          # NEW
-            response['quality_metrics'] = quality_results  # NEW
+        if quality_results is not None:
+            response['quality_metrics'] = quality_results
+
+        if data_quality_results is not None:             # NEW
+            response['data_quality'] = data_quality_results  # NEW
 
         return jsonify(response), 200
 
     except Exception as e:
         logger.error(f"Error processing dataset: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ------------------------------------------------------------------
+# NEW: Standalone Data Quality endpoint
+# ------------------------------------------------------------------
+
+@api_bp.route('/quality/<dataset_id>', methods=['GET'])
+def get_data_quality(dataset_id):
+    """
+    Run data quality scoring on an uploaded dataset.
+    Can be called before /process to assess data health first.
+
+    Returns:
+        JSON with scores for completeness, validity, consistency, uniqueness
+    """
+    try:
+        if dataset_id not in results_store:
+            return jsonify({'error': 'Dataset not found'}), 404
+
+        file_path = results_store[dataset_id]['file_path']
+        ingestion = DataIngestion()
+        df, _ = ingestion.load_dataset(file_path)
+        df_processed = ingestion.preprocess_dataset(df)
+
+        scorer = DataQualityScorer()
+        quality_report = scorer.score_all(df_processed)
+        quality_report = convert_numpy_types(quality_report)
+
+        return jsonify({
+            'dataset_id':     dataset_id,
+            'filename':       results_store[dataset_id]['filename'],
+            'data_quality':   quality_report,
+            'message':        'Data quality assessment complete',
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error scoring data quality: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 
